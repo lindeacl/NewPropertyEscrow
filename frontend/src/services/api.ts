@@ -1,6 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 
-const API_BASE_URL = 'https://propertyescrow-production.up.railway.app';
+const API_BASE_URL = 'http://localhost:8000';
 
 interface LoginResponse {
   access_token: string;

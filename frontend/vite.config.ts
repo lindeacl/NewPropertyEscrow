@@ -9,6 +9,11 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  server: {
+    host: true,
+    port: 5173,
+    allowedHosts: ["property-escrow-app-tunnel-dlez8lcg.devinapps.com"]
+  },
   build: {
     rollupOptions: {
       output: {
