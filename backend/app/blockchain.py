@@ -1,0 +1,497 @@
+from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
+import json
+import os
+import re
+import threading
+import queue
+import time
+from typing import Dict, Any, Optional
+from dotenv import load_dotenv
+
+backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+env_path = os.path.join(backend_dir, '.env')
+load_dotenv(env_path, override=True)
+
+class BlockchainService:
+    def __init__(self):
+        self.rpc_url = os.getenv("POLYGON_RPC_URL")
+        self.private_key = os.getenv("PRIVATE_KEY")
+        self.contract_address = os.getenv("CONTRACT_ADDRESS")
+        
+        self.is_deployed = os.getenv("FLY_APP_NAME") is not None or os.getenv("RAILWAY_ENVIRONMENT") is not None
+        self.environment = "DEPLOYED" if self.is_deployed else "LOCAL"
+        
+        print(f"DEBUG: Blockchain service initializing in {self.environment} environment")
+        
+        self.w3 = None
+        self.account = None
+        self.contract = None
+        self.connected = False
+        self._pending_nonce = None
+        self._nonce_lock = threading.Lock()
+        self._transaction_queue = queue.Queue()
+        self._queue_worker_running = False
+        
+        if self.rpc_url:
+            try:
+                from web3.providers import HTTPProvider
+                from web3.middleware import ExtraDataToPOAMiddleware
+                
+                provider_kwargs = {
+                    'request_kwargs': {
+                        'timeout': 60,
+                        'headers': {
+                            'Content-Type': 'application/json',
+                            'User-Agent': f'PropertyEscrow/1.0-{self.environment}'
+                        }
+                    }
+                }
+                
+                if self.is_deployed:
+                    provider_kwargs['request_kwargs'].update({
+                        'timeout': 120,
+                        'headers': {
+                            'Content-Type': 'application/json',
+                            'User-Agent': f'PropertyEscrow/1.0-{self.environment}',
+                            'Accept': 'application/json',
+                            'Connection': 'keep-alive'
+                        }
+                    })
+                    print(f"DEBUG: Using deployed environment provider configuration")
+                
+                provider = HTTPProvider(self.rpc_url, **provider_kwargs)
+                self.w3 = Web3(provider)
+                
+                self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                
+                if self.w3.is_connected():
+                    self.connected = True
+                    
+                    self.w3.eth.default_block = 'latest'
+                    
+                    if self.private_key:
+                        self.account = self.w3.eth.account.from_key(self.private_key)
+                        print(f"DEBUG: Account loaded: {self.account.address}")
+                    
+                    if self.contract_address:
+                        self.load_contract()
+                        
+                    chain_id = self.w3.eth.chain_id
+                    if chain_id != 137:
+                        print(f"WARNING: Connected to chain ID {chain_id}, expected 137 (Polygon)")
+                    else:
+                        print(f"DEBUG: Connected to Polygon mainnet (chain ID: {chain_id})")
+                        
+                else:
+                    print("Warning: Could not connect to Polygon network")
+            except Exception as e:
+                print(f"Warning: Blockchain initialization failed: {e}")
+        else:
+            print("Warning: POLYGON_RPC_URL not set - blockchain features disabled")
+    
+    def load_contract(self):
+        try:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            abi_path = os.path.join(app_dir, "PropertyEscrow.json")
+            
+            if not os.path.exists(abi_path):
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                abi_path = os.path.join(project_root, "artifacts", "contracts", "PropertyEscrow.sol", "PropertyEscrow.json")
+            
+            if os.path.exists(abi_path):
+                with open(abi_path, "r") as f:
+                    contract_json = json.load(f)
+                    contract_abi = contract_json["abi"]
+                
+                self.contract = self.w3.eth.contract(
+                    address=self.contract_address,
+                    abi=contract_abi
+                )
+                print(f"Contract loaded successfully at {self.contract_address}")
+            else:
+                print(f"Warning: Contract ABI not found at {abi_path}")
+        except Exception as e:
+            print(f"Warning: Could not load contract: {e}")
+    
+    def get_balance(self, address: str) -> float:
+        if not self.connected or not self.w3:
+            raise ValueError("Blockchain not connected")
+        balance_wei = self.w3.eth.get_balance(address)
+        return self.w3.from_wei(balance_wei, 'ether')
+    
+    def _get_next_nonce(self) -> int:
+        """Get the next available nonce, accounting for pending transactions"""
+        if not self.connected or not self.w3 or not self.account:
+            raise ValueError("Blockchain not connected or account not configured")
+        
+        network_nonce = self.w3.eth.get_transaction_count(self.account.address, 'pending')
+        
+        if self._pending_nonce is not None and self._pending_nonce >= network_nonce:
+            self._pending_nonce += 1
+        else:
+            self._pending_nonce = network_nonce
+        
+        print(f"DEBUG: Using nonce {self._pending_nonce} (network: {network_nonce})")
+        return self._pending_nonce
+
+    def _start_queue_worker(self):
+        """Start the transaction queue worker if not already running"""
+        if not self._queue_worker_running:
+            self._queue_worker_running = True
+            worker_thread = threading.Thread(target=self._process_transaction_queue, daemon=True)
+            worker_thread.start()
+            print("DEBUG: Transaction queue worker started")
+    
+    def _process_transaction_queue(self):
+        """Process transactions from the queue sequentially"""
+        while self._queue_worker_running:
+            try:
+                transaction_data, result_callback = self._transaction_queue.get(timeout=1)
+                print(f"DEBUG: Processing queued transaction")
+                try:
+                    tx_hash = self._execute_transaction(transaction_data)
+                    result_callback(tx_hash, None)
+                except Exception as e:
+                    print(f"DEBUG: Transaction failed: {e}")
+                    result_callback(None, e)
+                finally:
+                    self._transaction_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"DEBUG: Queue worker error: {e}")
+    
+    def _execute_transaction(self, transaction_data: Dict[str, Any]) -> str:
+        """Execute a single transaction with proper nonce management"""
+        if not self.connected or not self.w3 or not self.account:
+            raise ValueError("Blockchain not connected or account not configured")
+        
+        with self._nonce_lock:
+            nonce = self._get_next_nonce()
+            
+        gas_price = self.w3.to_wei('25', 'gwei')
+        
+        transaction = {
+            'from': self.account.address,
+            'gas': transaction_data.get('gas', 2000000),
+            'gasPrice': gas_price,
+            'nonce': nonce,
+            **{k: v for k, v in transaction_data.items() if k not in ['gas', 'gasPrice', 'nonce']}
+        }
+        
+        try:
+            print(f"DEBUG: Building transaction: {transaction}")
+            print(f"DEBUG: Transaction keys: {list(transaction.keys())}")
+            
+            for key, value in transaction.items():
+                if isinstance(value, str) and value.startswith('0x'):
+                    print(f"DEBUG: Field {key}: {value} (length: {len(value)}, even: {len(value) % 2 == 0})")
+                    if len(value) % 2 != 0:
+                        print(f"ERROR: Transaction field {key} has odd-length hex: {value}")
+                        raise ValueError(f"Invalid hex encoding in transaction field {key}: {value}")
+                else:
+                    print(f"DEBUG: Field {key}: {value} (type: {type(value)})")
+            
+            if 'chainId' not in transaction:
+                transaction['chainId'] = 137
+                print(f"DEBUG: Added chainId: 137")
+            
+            required_fields = ['from', 'gas', 'gasPrice', 'nonce', 'chainId']
+            for field in required_fields:
+                if field not in transaction:
+                    print(f"ERROR: Missing required field: {field}")
+                    raise ValueError(f"Transaction missing required field: {field}")
+            
+            print(f"DEBUG: About to sign transaction with Web3...")
+            print(f"DEBUG: Account address: {self.account.address}")
+            
+            signed_txn = self.w3.eth.account.sign_transaction(transaction, self.private_key)
+            
+            print(f"DEBUG: Transaction signed successfully in {self.environment} environment")
+            print(f"DEBUG: Signed transaction type: {type(signed_txn.raw_transaction)}")
+            print(f"DEBUG: Raw transaction bytes length: {len(signed_txn.raw_transaction)}")
+            
+            raw_tx_hex = signed_txn.raw_transaction.hex()
+            print(f"DEBUG: Raw transaction hex: {raw_tx_hex}")
+            print(f"DEBUG: Raw transaction length: {len(raw_tx_hex)} characters")
+            print(f"DEBUG: Raw transaction even length: {len(raw_tx_hex) % 2 == 0}")
+            print(f"DEBUG: Raw transaction first 100 chars: {raw_tx_hex[:100]}")
+            print(f"DEBUG: Raw transaction last 100 chars: {raw_tx_hex[-100:]}")
+            
+            # Environment-specific hex validation
+            if self.is_deployed:
+                print(f"DEPLOYED-DEBUG: Performing additional hex validation for deployed environment")
+                print(f"DEPLOYED-DEBUG: Raw hex type: {type(raw_tx_hex)}")
+                print(f"DEPLOYED-DEBUG: Raw hex repr: {repr(raw_tx_hex)}")
+                print(f"DEPLOYED-DEBUG: Raw hex encoding: {raw_tx_hex.encode('utf-8') if isinstance(raw_tx_hex, str) else 'Not string'}")
+                
+                if not raw_tx_hex.startswith('f9'):
+                    print(f"DEPLOYED-ERROR: Transaction hex doesn't start with expected RLP prefix 'f9': {raw_tx_hex[:10]}")
+                
+                import re
+                if not re.match(r'^[0-9a-fA-F]+$', raw_tx_hex):
+                    print(f"DEPLOYED-ERROR: Transaction hex contains invalid characters")
+                    invalid_chars = [c for c in raw_tx_hex if c not in '0123456789abcdefABCDEF']
+                    print(f"DEPLOYED-ERROR: Invalid characters found: {invalid_chars}")
+            
+            if len(raw_tx_hex) % 2 != 0:
+                print(f"ERROR: Raw transaction has odd length: {len(raw_tx_hex)} in {self.environment} environment")
+                print(f"ERROR: Last character: '{raw_tx_hex[-1]}'")
+                print(f"ERROR: Hex validation failed - transaction corrupted during signing")
+                raise ValueError(f"Invalid transaction encoding: hex string has odd length ({len(raw_tx_hex)}) in {self.environment}")
+            
+            print(f"DEBUG: About to send raw transaction to Alchemy from {self.environment} environment...")
+            print(f"DEBUG: Alchemy endpoint: {self.rpc_url}")
+            
+            alchemy_hex = f"0x{raw_tx_hex}"
+            print(f"DEBUG: Sending hex with 0x prefix: {alchemy_hex[:100]}...")
+            
+            if self.is_deployed:
+                print(f"DEPLOYED-DEBUG: Full Alchemy hex being sent: {alchemy_hex}")
+                print(f"DEPLOYED-DEBUG: Alchemy hex length: {len(alchemy_hex)}")
+                print(f"DEPLOYED-DEBUG: Alchemy hex even: {len(alchemy_hex) % 2 == 0}")
+            
+            print(f"DEBUG: Raw transaction bytes type: {type(signed_txn.raw_transaction)}")
+            print(f"DEBUG: Raw transaction bytes repr: {repr(signed_txn.raw_transaction)}")
+            print(f"DEBUG: Raw transaction hex() method result: {signed_txn.raw_transaction.hex()}")
+            
+            import json
+            rpc_payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_sendRawTransaction",
+                "params": [alchemy_hex],
+                "id": 1
+            }
+            
+            if self.is_deployed:
+                print(f"DEPLOYED-DEBUG: RPC payload being sent: {json.dumps(rpc_payload)}")
+                print(f"DEPLOYED-DEBUG: RPC payload hex param: {rpc_payload['params'][0][:100]}...")
+                print(f"DEPLOYED-DEBUG: RPC payload hex param length: {len(rpc_payload['params'][0])}")
+                print(f"DEPLOYED-DEBUG: RPC payload hex param even: {len(rpc_payload['params'][0]) % 2 == 0}")
+            else:
+                print(f"DEBUG: RPC payload being sent: {json.dumps(rpc_payload)}")
+                print(f"DEBUG: RPC payload hex param length: {len(rpc_payload['params'][0])}")
+                print(f"DEBUG: RPC payload hex param even: {len(rpc_payload['params'][0]) % 2 == 0}")
+            
+            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            print(f"DEBUG: Transaction sent successfully with nonce {nonce}, hash: {tx_hash.hex()} in {self.environment} environment")
+            return tx_hash.hex()
+        except Exception as e:
+            print(f"DEBUG: Transaction execution failed: {e}")
+            print(f"DEBUG: Exception type: {type(e)}")
+            
+            if "could not replace existing tx" in str(e) or "INTERNAL_ERROR" in str(e):
+                print(f"ERROR: Alchemy hex encoding error detected!")
+                print(f"ERROR: Raw transaction that failed: {raw_tx_hex if 'raw_tx_hex' in locals() else 'Not available'}")
+                print(f"ERROR: Transaction data that failed: {transaction}")
+                print(f"ERROR: Signed transaction type: {type(signed_txn.raw_transaction) if 'signed_txn' in locals() else 'Not available'}")
+                
+                if 'raw_tx_hex' in locals():
+                    print(f"ERROR: Hex analysis - Length: {len(raw_tx_hex)}, Even: {len(raw_tx_hex) % 2 == 0}")
+                    print(f"ERROR: Hex first 200 chars: {raw_tx_hex[:200]}")
+                    print(f"ERROR: Hex last 200 chars: {raw_tx_hex[-200:]}")
+            
+            import traceback
+            traceback.print_exc()
+            with self._nonce_lock:
+                self._pending_nonce = None
+            raise e
+
+    def send_transaction(self, transaction_data: Dict[str, Any]) -> str:
+        """Queue a transaction for execution and wait for result"""
+        if not self._queue_worker_running:
+            self._start_queue_worker()
+        
+        result_event = threading.Event()
+        result_data = {'tx_hash': None, 'error': None}
+        
+        def result_callback(tx_hash, error):
+            result_data['tx_hash'] = tx_hash
+            result_data['error'] = error
+            result_event.set()
+        
+        print(f"DEBUG: Queueing transaction for sequential processing")
+        self._transaction_queue.put((transaction_data, result_callback))
+        
+        if result_event.wait(timeout=120):
+            if result_data['error']:
+                raise result_data['error']
+            return result_data['tx_hash']
+        else:
+            raise TimeoutError("Transaction execution timed out")
+    
+    def wait_for_transaction_receipt(self, tx_hash: str, timeout: int = 120):
+        if not self.connected or not self.w3:
+            raise ValueError("Blockchain not connected")
+        return self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+    
+    def list_property(self, property_address: str, description: str, price: int, metadata_uri: str) -> str:
+        if not self.connected or not self.contract or not self.account:
+            raise ValueError("Blockchain not connected or contract/account not loaded")
+        
+        function_call = self.contract.functions.listProperty(
+            property_address, description, price, metadata_uri
+        )
+        
+        transaction = function_call.build_transaction({
+            'from': self.account.address,
+            'gas': 500000,
+            'gasPrice': self.w3.to_wei('25', 'gwei'),
+        })
+        
+        return self.send_transaction(transaction)
+    
+    def create_escrow(self, property_id: int, agent_address: str, inspection_days: int, 
+                     closing_date: int, terms: str, earnest_money: float) -> str:
+        if not self.connected or not self.contract or not self.account:
+            raise ValueError("Blockchain not connected or contract/account not loaded")
+        
+        self._validate_escrow_inputs(property_id, agent_address, inspection_days, closing_date, terms, earnest_money)
+        
+        try:
+            earnest_money_wei = self.w3.to_wei(earnest_money, 'ether')
+            
+            function_call = self.contract.functions.createEscrow(
+                property_id, agent_address, inspection_days, closing_date, terms
+            )
+            
+            transaction = function_call.build_transaction({
+                'from': self.account.address,
+                'value': earnest_money_wei,
+                'gas': 800000,
+                'gasPrice': self.w3.to_wei('25', 'gwei'),
+            })
+            
+            return self.send_transaction(transaction)
+        except Exception as e:
+            error_message = self._transform_blockchain_error(str(e))
+            raise ValueError(error_message)
+    
+    def get_property(self, property_id: int) -> Dict[str, Any]:
+        if not self.connected or not self.contract:
+            raise ValueError("Blockchain not connected or contract not loaded")
+        
+        result = self.contract.functions.getProperty(property_id).call()
+        return {
+            'id': result[0],
+            'propertyAddress': result[1],
+            'description': result[2],
+            'price': result[3],
+            'seller': result[4],
+            'isActive': result[5],
+            'metadataURI': result[6]
+        }
+    
+    def get_escrow_transaction(self, transaction_id: int) -> Dict[str, Any]:
+        if not self.connected or not self.contract:
+            raise ValueError("Blockchain not connected or contract not loaded")
+        
+        result = self.contract.functions.getEscrowTransaction(transaction_id).call()
+        return {
+            'id': result[0],
+            'propertyId': result[1],
+            'buyer': result[2],
+            'seller': result[3],
+            'agent': result[4],
+            'purchasePrice': result[5],
+            'earnestMoney': result[6],
+            'inspectionPeriodEnd': result[7],
+            'closingDate': result[8],
+            'status': result[9],
+            'buyerApproval': result[10],
+            'sellerApproval': result[11],
+            'agentApproval': result[12],
+            'adminOverride': result[13],
+            'terms': result[14],
+            'createdAt': result[15]
+        }
+    
+    def give_approval(self, transaction_id: int, approval_type: str) -> str:
+        if not self.connected or not self.contract or not self.account:
+            raise ValueError("Blockchain not connected or contract/account not loaded")
+        
+        if approval_type == "buyer":
+            function_call = self.contract.functions.giveBuyerApproval(transaction_id)
+        elif approval_type == "seller":
+            function_call = self.contract.functions.giveSellerApproval(transaction_id)
+        elif approval_type == "agent":
+            function_call = self.contract.functions.giveAgentApproval(transaction_id)
+        else:
+            raise ValueError("Invalid approval type")
+        
+        transaction = function_call.build_transaction({
+            'from': self.account.address,
+            'gas': 300000,
+            'gasPrice': self.w3.to_wei('25', 'gwei'),
+        })
+        
+        return self.send_transaction(transaction)
+    
+    def is_connected(self) -> bool:
+        return self.connected and self.w3 is not None
+    
+    def _validate_escrow_inputs(self, property_id: int, agent_address: str, inspection_days: int, 
+                               closing_date: int, terms: str, earnest_money: float):
+        """Validate escrow inputs before blockchain interaction"""
+        errors = []
+        
+        if property_id <= 0:
+            errors.append("Property ID must be a positive number")
+        
+        if not agent_address:
+            errors.append("Agent wallet address is required")
+        elif not self._is_valid_ethereum_address(agent_address):
+            errors.append("Agent wallet address must be a valid Ethereum address (0x followed by 40 characters)")
+        
+        if inspection_days <= 0:
+            errors.append("Inspection days must be a positive number")
+        
+        if closing_date <= 0:
+            errors.append("Closing date must be a valid timestamp")
+        
+        if not terms or len(terms.strip()) < 10:
+            errors.append("Terms and conditions must be at least 10 characters long")
+        
+        if earnest_money <= 0:
+            errors.append("Earnest money must be a positive amount")
+        
+        if errors:
+            raise ValueError(". ".join(errors))
+    
+    def _is_valid_ethereum_address(self, address: str) -> bool:
+        """Validate Ethereum address format"""
+        if not address or not isinstance(address, str):
+            return False
+        
+        if not re.match(r'^0x[a-fA-F0-9]{40}$', address):
+            return False
+        
+        try:
+            return self.w3.is_address(address)
+        except:
+            return True  # Fallback to regex validation
+    
+    def _transform_blockchain_error(self, error_message: str) -> str:
+        """Transform technical blockchain errors into user-friendly messages"""
+        error_lower = error_message.lower()
+        
+        if "abi not found" in error_lower or "argument" in error_lower and "not compatible" in error_lower:
+            if "address" in error_lower:
+                return "Invalid wallet address format. Please enter a valid Ethereum address starting with 0x followed by 40 characters."
+        
+        if "insufficient funds" in error_lower:
+            return "Insufficient funds in your wallet to complete this transaction."
+        
+        if "gas" in error_lower and ("limit" in error_lower or "estimate" in error_lower):
+            return "Transaction failed due to gas estimation issues. Please try again or contact support."
+        
+        if "nonce" in error_lower or "could not replace existing tx" in error_lower:
+            return "Transaction ordering issue. Please wait a moment and try again."
+        
+        if "revert" in error_lower:
+            return "Transaction was rejected by the smart contract. Please check your inputs and try again."
+        
+        return f"Transaction failed: {error_message}"
+
+blockchain_service = BlockchainService()
